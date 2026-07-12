@@ -1,273 +1,468 @@
 """
 Rise AI Microservice — FastAPI entrypoint.
 
-This is the entire AI layer. Your backend (Node/Express, or whatever you use)
-calls these endpoints over HTTP and gets card-ready JSON back. Nothing here
-does auth, payments, persistence, or business logic outside the AI itself —
-that's all your backend's job.
+This is the entire AI layer. Your backend (Node/Express, etc.) calls these
+endpoints over HTTP and gets card-ready JSON back. Nothing here does auth,
+payments, persistence, or business logic — that's your backend's job.
 
-Run locally:
-    uvicorn app.main:app --reload --port 8000
-  OR:
+Run:
     python app/main.py
+  OR:
+    uvicorn app.main:app --reload --port 8000
 
-Interactive API docs (auto-generated from the Pydantic models in models.py):
-    http://localhost:8000/docs
+Docs: http://127.0.0.1:8000/docs
 """
 
 import sys
 import os
 
-# Ensure the project root is on sys.path so "app.*" imports work whether this
-# file is launched via `uvicorn app.main:app` or `python app/main.py`.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from dotenv import load_dotenv
+load_dotenv()
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from dotenv import load_dotenv
-
-load_dotenv()
 
 from app.models import (
-    ContextRequest,
-    CoachRequest,
-    FocusRequest,
-    PlanRequest,
-    InterventionRequest,
-    FutureMeRequest,
-    RecapRequest,
-    MusicRequest,
-    RewardRequest,
-    GoalsProgressRequest,
-    MemoryExtractRequest,
+    # requests
+    ContextRequest, CoachRequest, FocusRequest, PlanRequest,
+    InterventionRequest, FutureMeRequest, RecapRequest,
+    MusicRequest, RewardRequest, GoalsProgressRequest, MemoryExtractRequest,
+    # responses
+    ContextResponse, CoachResponse, FocusResponse, PlanResponse,
+    InterventionResponse, FutureMeResponse, RecapResponse,
+    MusicResponse, RewardResponse, GoalsProgressResponse, MemoryExtractResponse,
+    HealthResponse, CostResponse, MemoryReadResponse,
 )
 from app.prompts.base_prompt import build_system_prompt
 from app.prompts.endpoint_prompts import ENDPOINT_PROMPTS
 from app.services.claude_client import call_claude_json, stream_claude, get_cost_ledger, AIServiceError
 from app.services.memory_store import get_memories, add_memories
 
+# ── App ───────────────────────────────────────────────────────────────────────
+
+tags_metadata = [
+    {"name": "System",     "description": "Health check and usage/cost visibility."},
+    {"name": "Core",       "description": "Context snapshot and coach card — the two most-used endpoints."},
+    {"name": "Planning",   "description": "Focus tasks and day planning."},
+    {"name": "Wellbeing",  "description": "Interventions, future projection, and evening recap."},
+    {"name": "Engagement", "description": "Music suggestions, reward progress, and goal tracking."},
+    {"name": "Memory",     "description": "Read and extract durable user memories for personalisation."},
+]
+
 app = FastAPI(
     title="Rise AI Microservice",
-    description="AI-only backend for the Rise app: coach, focus, intervention, future-me, and related endpoints.",
+    description=(
+        "AI-only backend for the Rise app.\n\n"
+        "## Auto-detection\n"
+        "Every endpoint supports a `message` field. When provided, the AI uses it to:\n"
+        "- **Infer mood** if `mood` is not explicitly set\n"
+        "- **Infer energy** if `energy` is not set\n"
+        "- **Choose the best personality** when `coach_personality` is `auto`\n\n"
+        "The chosen/detected values are always returned as `detected_mood` and "
+        "`detected_personality` so your frontend can cache and display them.\n\n"
+        "## Personalities\n"
+        "| Key | Style |\n"
+        "|---|---|\n"
+        "| `auto` | AI picks from message tone |\n"
+        "| `sweet` | Warm, nurturing best-friend |\n"
+        "| `strict` | Direct, no-nonsense coach |\n"
+        "| `sarcastic` | Witty, teasing but caring |\n"
+        "| `ceo` | Strategic, results-driven |\n"
+        "| `therapeutic` | Calm, validating, trauma-informed |"
+    ),
     version="1.0.0",
+    openapi_tags=tags_metadata,
 )
 
 
-def _resolve_memories(req: "BaseAIRequest") -> list[str]:
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _resolve_memories(req) -> list[str]:
     if req.memories:
         return req.memories
-    return get_memories(req.user_id)
+    if req.user_id:
+        return get_memories(req.user_id)
+    return []
+
+
+def _maybe(value, fallback: str = "(infer from message above)") -> str:
+    return value if value is not None else fallback
 
 
 async def _run_endpoint(endpoint_key: str, req, user_prompt: str) -> dict:
-    """Shared logic: build prompt -> call Claude -> return JSON. Used by every endpoint below."""
-    config = ENDPOINT_PROMPTS[endpoint_key]
+    config   = ENDPOINT_PROMPTS[endpoint_key]
     memories = _resolve_memories(req)
 
+    personality           = getattr(req, "coach_personality", "auto")
+    mood                  = getattr(req, "mood", None)
+    energy                = getattr(req, "energy", None)
+    needs_mood_detection  = mood is None
+    needs_energy_detection = energy is None
+
     system_prompt = build_system_prompt(
-        personality=req.coach_personality,
+        personality=personality,
         memories=memories,
         extra_instructions=(
             f"{config['instructions']}\n\n"
             f"Return JSON matching EXACTLY this schema (no extra fields):\n{config['schema']}"
         ),
+        needs_mood_detection=needs_mood_detection,
+        needs_energy_detection=needs_energy_detection,
     )
 
     try:
-        result = await call_claude_json(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=400)
+        result = await call_claude_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=450,
+        )
     except AIServiceError as err:
-        raise HTTPException(status_code=err.status_code, detail={"error": err.code, "message": err.message})
+        raise HTTPException(
+            status_code=err.status_code,
+            detail={"error": err.code, "message": err.message},
+        )
 
-    return {**result["data"], "_meta": {"usage": result["usage"]}}
+    return {**result["data"], "meta": result["usage"]}
 
 
-@app.get("/health")
+def _build_user_prompt(req, core_lines: list[str]) -> str:
+    parts = []
+    if getattr(req, "message", None):
+        parts.append(f'User\'s message: "{req.message}"')
+        parts.append("")
+    parts.extend(core_lines)
+    return "\n".join(parts)
+
+
+# ── System ────────────────────────────────────────────────────────────────────
+
+@app.get(
+    "/health",
+    tags=["System"],
+    summary="Health check",
+    response_model=HealthResponse,
+)
 async def health():
     return {"status": "ok", "service": "rise-ai-microservice"}
 
 
-@app.get("/ai/cost")
+@app.get(
+    "/ai/cost",
+    tags=["System"],
+    summary="Token & cost usage",
+    description="Running token + cost totals since the process started. Resets on restart. Dev visibility only.",
+    response_model=CostResponse,
+)
 async def cost():
-    """Running token + cost totals since the process started. Dev visibility only — resets on restart."""
     return get_cost_ledger()
 
 
-@app.get("/ai/memory/{user_id}")
+# ── Memory ────────────────────────────────────────────────────────────────────
+
+@app.get(
+    "/ai/memory/{user_id}",
+    tags=["Memory"],
+    summary="Read stored memories",
+    description="Returns all durable memories stored for a user.",
+    response_model=MemoryReadResponse,
+)
 async def read_memory(user_id: str):
-    """Convenience read endpoint so the memory engine is actually inspectable without a DB."""
     return {"user_id": user_id, "memories": get_memories(user_id)}
 
 
-# ---------------------------------------------------------------------------
-# POST /ai/context
-# ---------------------------------------------------------------------------
-@app.post("/ai/context")
-async def ai_context(req: ContextRequest):
-    user_prompt = (
-        f"Current mood: {req.mood}\nCurrent energy: {req.energy}\n"
-        f"Goals: {', '.join(req.goals) or 'none stated'}\n\nGenerate the context snapshot."
-    )
-    return await _run_endpoint("context", req, user_prompt)
-
-
-# ---------------------------------------------------------------------------
-# POST /ai/coach
-# ---------------------------------------------------------------------------
-@app.post("/ai/coach")
-async def ai_coach(req: CoachRequest):
-    user_prompt = (
-        f"Mood: {req.mood}\nEnergy: {req.energy}\n"
-        f"Goals: {', '.join(req.goals) or 'none stated'}\n\nGenerate one coach card now."
-    )
-    return await _run_endpoint("coach", req, user_prompt)
-
-
-# ---------------------------------------------------------------------------
-# POST /ai/focus
-# ---------------------------------------------------------------------------
-@app.post("/ai/focus")
-async def ai_focus(req: FocusRequest):
-    user_prompt = (
-        f"Goals: {', '.join(req.goals)}\nFree minutes available today: {req.free_minutes}\n"
-        f"Energy: {req.energy}\n\nGenerate today's focus."
-    )
-    return await _run_endpoint("focus", req, user_prompt)
-
-
-# ---------------------------------------------------------------------------
-# POST /ai/plan
-# ---------------------------------------------------------------------------
-@app.post("/ai/plan")
-async def ai_plan(req: PlanRequest):
-    user_prompt = (
-        f"Goals: {', '.join(req.goals)}\nAvailable calendar gaps: {', '.join(req.calendar_gaps) or 'none provided'}\n"
-        f"Energy: {req.energy}\nMood: {req.mood}\n\nGenerate a short plan."
-    )
-    return await _run_endpoint("plan", req, user_prompt)
-
-
-# ---------------------------------------------------------------------------
-# POST /ai/intervention
-# ---------------------------------------------------------------------------
-@app.post("/ai/intervention")
-async def ai_intervention(req: InterventionRequest):
-    user_prompt = (
-        f'User has been doing "{req.activity}" for {req.minutes_spent} minutes.\n\n'
-        "Generate a playful, kind intervention card with one tiny alternative action."
-    )
-    return await _run_endpoint("intervention", req, user_prompt)
-
-
-# ---------------------------------------------------------------------------
-# POST /ai/future-me
-# ---------------------------------------------------------------------------
-@app.post("/ai/future-me")
-async def ai_future_me(req: FutureMeRequest):
-    user_prompt = (
-        f"Goal: {req.goal}\nCurrent consistency: {req.consistency}%\n\nGenerate a \"Future You\" projection card."
-    )
-    return await _run_endpoint("future-me", req, user_prompt)
-
-
-# ---------------------------------------------------------------------------
-# POST /ai/recap
-# ---------------------------------------------------------------------------
-@app.post("/ai/recap")
-async def ai_recap(req: RecapRequest):
-    user_prompt = (
-        f"Completed today: {', '.join(req.completed_actions)}\nTotal points earned: {req.total_points}\n\n"
-        "Generate the evening recap card."
-    )
-    return await _run_endpoint("recap", req, user_prompt)
-
-
-# ---------------------------------------------------------------------------
-# POST /ai/music
-# ---------------------------------------------------------------------------
-@app.post("/ai/music")
-async def ai_music(req: MusicRequest):
-    user_prompt = (
-        f"Activity: {req.activity}\nMood: {req.mood}\nEnergy: {req.energy}\n\n"
-        "Generate a playlist mood suggestion."
-    )
-    return await _run_endpoint("music", req, user_prompt)
-
-
-# ---------------------------------------------------------------------------
-# POST /ai/reward
-# ---------------------------------------------------------------------------
-@app.post("/ai/reward")
-async def ai_reward(req: RewardRequest):
-    user_prompt = (
-        f"Chosen reward: {req.reward}\nCurrent points: {req.current_points}\nReward cost: {req.reward_cost}\n\n"
-        "Generate a progress-toward-reward update."
-    )
-    return await _run_endpoint("reward", req, user_prompt)
-
-
-# ---------------------------------------------------------------------------
-# POST /ai/goals/progress
-# ---------------------------------------------------------------------------
-@app.post("/ai/goals/progress")
-async def ai_goals_progress(req: GoalsProgressRequest):
-    user_prompt = (
-        f"Goal: {req.goal}\nCurrent progress: {req.progress}%\nPace note: {req.pace_note or 'none provided'}\n\n"
-        "Generate a progress update with a realistic prediction."
-    )
-    return await _run_endpoint("goals/progress", req, user_prompt)
-
-
-# ---------------------------------------------------------------------------
-# POST /ai/memory/extract
-# This one both calls Claude AND writes results into the memory store,
-# so it doesn't go through the shared _run_endpoint helper.
-# ---------------------------------------------------------------------------
-@app.post("/ai/memory/extract")
+@app.post(
+    "/ai/memory/extract",
+    tags=["Memory"],
+    summary="Extract memories from text",
+    description=(
+        "Analyses raw user text (chat message, voice transcript, journal entry) and extracts "
+        "durable personalisation facts. Extracted memories are stored and returned."
+    ),
+    response_model=MemoryExtractResponse,
+)
 async def ai_memory_extract(req: MemoryExtractRequest):
     config = ENDPOINT_PROMPTS["memory/extract"]
     system_prompt = build_system_prompt(
         extra_instructions=(
             f"{config['instructions']}\n\n"
-            f"Return JSON matching EXACTLY this schema (no extra fields):\n{config['schema']}"
+            f"Return JSON matching EXACTLY this schema:\n{config['schema']}"
         ),
     )
     user_prompt = f'Raw input from user:\n"{req.text}"\n\nExtract durable memories, if any.'
 
     try:
-        result = await call_claude_json(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=250)
+        result = await call_claude_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=300,
+        )
     except AIServiceError as err:
-        raise HTTPException(status_code=err.status_code, detail={"error": err.code, "message": err.message})
+        raise HTTPException(
+            status_code=err.status_code,
+            detail={"error": err.code, "message": err.message},
+        )
 
-    data = result["data"]
-    saved = add_memories(req.user_id, data.get("memories", []))
+    data   = result["data"]
+    saved  = add_memories(req.user_id, data.get("memories", []))
+    return {**data, "stored_memories": saved, "meta": result["usage"]}
 
-    return {**data, "stored_memories": saved, "_meta": {"usage": result["usage"]}}
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/ai/context",
+    tags=["Core"],
+    summary="Generate context snapshot",
+    description=(
+        "Summarises the user's emotional + situational context. "
+        "Used internally to feed other endpoints. Mood and energy can be auto-detected from `message`."
+    ),
+    response_model=ContextResponse,
+)
+async def ai_context(req: ContextRequest):
+    user_prompt = _build_user_prompt(req, [
+        f"Current mood: {_maybe(req.mood)}",
+        f"Current energy: {_maybe(req.energy)}",
+        f"Goals: {', '.join(req.goals) or 'none stated'}",
+        "",
+        "Generate the context snapshot.",
+    ])
+    return await _run_endpoint("context", req, user_prompt)
 
 
-# ---------------------------------------------------------------------------
-# Streaming variants — one example wired up (coach); same pattern applies
-# to any endpoint above if your backend dev wants SSE instead of single JSON.
-# ---------------------------------------------------------------------------
-@app.post("/ai/coach/stream")
+@app.post(
+    "/ai/coach",
+    tags=["Core"],
+    summary="Generate a coach card",
+    description=(
+        "The primary coaching endpoint. Returns one motivational coach card personalised to the "
+        "user's current mood, energy, and goals. Mood, energy, and personality can all be "
+        "auto-detected from `message`."
+    ),
+    response_model=CoachResponse,
+)
+async def ai_coach(req: CoachRequest):
+    user_prompt = _build_user_prompt(req, [
+        f"Mood: {_maybe(req.mood)}",
+        f"Energy: {_maybe(req.energy)}",
+        f"Goals: {', '.join(req.goals) or 'none stated'}",
+        "",
+        "Generate one coach card now.",
+    ])
+    return await _run_endpoint("coach", req, user_prompt)
+
+
+# ── Planning ──────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/ai/focus",
+    tags=["Planning"],
+    summary="Generate today's focus tasks",
+    description=(
+        "Returns 1–3 small tasks that fit within the user's available free time and energy level. "
+        "Energy can be auto-detected from `message`."
+    ),
+    response_model=FocusResponse,
+)
+async def ai_focus(req: FocusRequest):
+    user_prompt = _build_user_prompt(req, [
+        f"Goals: {', '.join(req.goals)}",
+        f"Free minutes available: {req.free_minutes}",
+        f"Energy: {_maybe(req.energy)}",
+        "",
+        "Generate today's focus tasks.",
+    ])
+    return await _run_endpoint("focus", req, user_prompt)
+
+
+@app.post(
+    "/ai/plan",
+    tags=["Planning"],
+    summary="Generate a day plan",
+    description=(
+        "Creates a personalised 2–4 item day plan based on goals, calendar gaps, mood, and energy. "
+        "Mood and energy can be auto-detected from `message`."
+    ),
+    response_model=PlanResponse,
+)
+async def ai_plan(req: PlanRequest):
+    user_prompt = _build_user_prompt(req, [
+        f"Goals: {', '.join(req.goals)}",
+        f"Calendar gaps: {', '.join(req.calendar_gaps) or 'none provided'}",
+        f"Energy: {_maybe(req.energy)}",
+        f"Mood: {_maybe(req.mood)}",
+        "",
+        "Generate a short day plan.",
+    ])
+    return await _run_endpoint("plan", req, user_prompt)
+
+
+# ── Wellbeing ─────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/ai/intervention",
+    tags=["Wellbeing"],
+    summary="Generate a distraction intervention",
+    description=(
+        "Playfully interrupts the user when they've been doom-scrolling, binge-watching, or "
+        "procrastinating. Never judgmental — always kind and funny."
+    ),
+    response_model=InterventionResponse,
+)
+async def ai_intervention(req: InterventionRequest):
+    user_prompt = _build_user_prompt(req, [
+        f'User has been doing "{req.activity}" for {req.minutes_spent} minutes.',
+        "",
+        "Generate a playful, kind intervention card with one tiny alternative action.",
+    ])
+    return await _run_endpoint("intervention", req, user_prompt)
+
+
+@app.post(
+    "/ai/future-me",
+    tags=["Wellbeing"],
+    summary="Generate a Future Me projection",
+    description=(
+        "Projects a warm, realistic vision of the user's future if they maintain their current "
+        "consistency on a given goal."
+    ),
+    response_model=FutureMeResponse,
+)
+async def ai_future_me(req: FutureMeRequest):
+    user_prompt = _build_user_prompt(req, [
+        f"Goal: {req.goal}",
+        f"Current consistency: {req.consistency}%",
+        "",
+        'Generate a "Future You" projection card.',
+    ])
+    return await _run_endpoint("future-me", req, user_prompt)
+
+
+@app.post(
+    "/ai/recap",
+    tags=["Wellbeing"],
+    summary="Generate an evening recap",
+    description=(
+        "Summarises the user's day from their completed actions into a warm, proud-feeling recap card."
+    ),
+    response_model=RecapResponse,
+)
+async def ai_recap(req: RecapRequest):
+    user_prompt = _build_user_prompt(req, [
+        f"Completed today: {', '.join(req.completed_actions)}",
+        f"Total points earned: {req.total_points}",
+        "",
+        "Generate the evening recap card.",
+    ])
+    return await _run_endpoint("recap", req, user_prompt)
+
+
+# ── Engagement ────────────────────────────────────────────────────────────────
+
+@app.post(
+    "/ai/music",
+    tags=["Engagement"],
+    summary="Generate a music mood suggestion",
+    description=(
+        "Recommends a playlist vibe and genre tags based on the user's activity, mood, and energy. "
+        "Never invents real artist names — describes genre and mood only. "
+        "Mood and energy can be auto-detected from `message`."
+    ),
+    response_model=MusicResponse,
+)
+async def ai_music(req: MusicRequest):
+    user_prompt = _build_user_prompt(req, [
+        f"Activity: {req.activity}",
+        f"Mood: {_maybe(req.mood)}",
+        f"Energy: {_maybe(req.energy)}",
+        "",
+        "Generate a playlist mood suggestion.",
+    ])
+    return await _run_endpoint("music", req, user_prompt)
+
+
+@app.post(
+    "/ai/reward",
+    tags=["Engagement"],
+    summary="Generate a reward progress update",
+    description=(
+        "Encourages the user on their progress toward a self-chosen reward. "
+        "Uses current points vs reward cost to motivate, never guilt."
+    ),
+    response_model=RewardResponse,
+)
+async def ai_reward(req: RewardRequest):
+    user_prompt = _build_user_prompt(req, [
+        f"Chosen reward: {req.reward}",
+        f"Current points: {req.current_points}",
+        f"Reward cost: {req.reward_cost}",
+        "",
+        "Generate a progress-toward-reward update.",
+    ])
+    return await _run_endpoint("reward", req, user_prompt)
+
+
+@app.post(
+    "/ai/goals/progress",
+    tags=["Engagement"],
+    summary="Generate a goal progress update",
+    description=(
+        "Returns an encouraging progress update with a realistic pace-based prediction "
+        "for the given goal."
+    ),
+    response_model=GoalsProgressResponse,
+)
+async def ai_goals_progress(req: GoalsProgressRequest):
+    user_prompt = _build_user_prompt(req, [
+        f"Goal: {req.goal}",
+        f"Current progress: {req.progress}%",
+        f"Pace note: {req.pace_note or 'none provided'}",
+        "",
+        "Generate a progress update with a realistic prediction.",
+    ])
+    return await _run_endpoint("goals/progress", req, user_prompt)
+
+
+# ── Streaming (SSE) ───────────────────────────────────────────────────────────
+
+@app.post(
+    "/ai/coach/stream",
+    tags=["Core"],
+    summary="Coach card — streaming (SSE)",
+    description=(
+        "Same as `/ai/coach` but streams the response as Server-Sent Events. "
+        "Each `data:` event is a text delta. An `event: done` marks completion."
+    ),
+)
 async def ai_coach_stream(req: CoachRequest):
-    config = ENDPOINT_PROMPTS["coach"]
-    memories = _resolve_memories(req)
+    config    = ENDPOINT_PROMPTS["coach"]
+    memories  = _resolve_memories(req)
+    mood      = getattr(req, "mood", None)
+    energy    = getattr(req, "energy", None)
+
     system_prompt = build_system_prompt(
         personality=req.coach_personality,
         memories=memories,
         extra_instructions=(
             f"{config['instructions']}\n\n"
-            f"Return JSON matching EXACTLY this schema (no extra fields):\n{config['schema']}"
+            f"Return JSON matching EXACTLY this schema:\n{config['schema']}"
         ),
+        needs_mood_detection=mood is None,
+        needs_energy_detection=energy is None,
     )
-    user_prompt = (
-        f"Mood: {req.mood}\nEnergy: {req.energy}\n"
-        f"Goals: {', '.join(req.goals) or 'none stated'}\n\nGenerate one coach card now."
-    )
+    user_prompt = _build_user_prompt(req, [
+        f"Mood: {_maybe(req.mood)}",
+        f"Energy: {_maybe(req.energy)}",
+        f"Goals: {', '.join(req.goals) or 'none stated'}",
+        "",
+        "Generate one coach card now.",
+    ])
 
     async def event_stream():
         try:
-            async for delta in stream_claude(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=400):
+            async for delta in stream_claude(system_prompt=system_prompt, user_prompt=user_prompt, max_tokens=450):
                 yield f"data: {delta}\n\n"
             yield "event: done\ndata: {}\n\n"
         except AIServiceError as err:

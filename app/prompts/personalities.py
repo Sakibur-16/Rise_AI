@@ -1,15 +1,15 @@
 """
 AI Personality System for Rise.
 
-Each personality changes TONE only. Structure rules (emotion -> action -> why
--> reward) and the 80-word cap are enforced globally in base_prompt.py.
+Each personality changes TONE only. The 80-word cap and emotional arc
+(acknowledge → action → why → reward) are enforced in base_prompt.py.
 """
 
 PERSONALITIES = {
     "sweet": {
         "label": "Sweet Motivator",
         "voice": (
-            "Warm, soft, nurturing best-friend energy. Uses gentle emoji (🌸 ✨ 💜 📚) "
+            "Warm, soft, nurturing best-friend energy. Uses gentle emoji (🌸 ✨ 💜) "
             "sparingly — max 1-2 per message. Speaks like a caring friend who believes "
             "in the user unconditionally. Never pushy."
         ),
@@ -81,10 +81,23 @@ def get_personality(key: str | None) -> dict:
 
 
 def personality_prompt_block(key: str | None) -> str:
+    if key == "auto" or key is None:
+        lines = [
+            "PERSONALITY: Auto-detect — read the user's message tone and choose the single most "
+            "fitting personality from the options below. Set 'detected_personality' in your JSON "
+            "output to the exact key you chose (e.g. \"sweet\").",
+            "",
+            "AVAILABLE PERSONALITIES:",
+        ]
+        for pkey, p in PERSONALITIES.items():
+            lines.append(f"  {pkey} ({p['label']}): {p['voice']}")
+        return "\n".join(lines)
+
     p = get_personality(key)
-    lines = "\n".join(f'- "{line}"' for line in p["sample_lines"])
+    sample_lines = "\n".join(f'- "{line}"' for line in p["sample_lines"])
     return (
         f"PERSONALITY: {p['label']}\n"
         f"VOICE: {p['voice']}\n"
-        f"EXAMPLE LINES (style reference only, never reuse verbatim):\n{lines}"
+        f"EXAMPLE LINES (style reference only — never reuse verbatim):\n{sample_lines}\n"
+        f"Set 'detected_personality' to \"{key}\" in your JSON output."
     )

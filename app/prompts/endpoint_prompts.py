@@ -1,116 +1,179 @@
 """
 Per-endpoint instructions + JSON schema contracts.
 
-Schemas are kept strict and minimal — your backend dev renders these
-directly into mobile cards, so field names here are the contract.
+Every schema includes:
+  - `detected_personality` — which personality was used (explicit or auto-chosen)
+  - `detected_mood`        — on mood-aware endpoints, the mood used (provided or inferred)
+
+These fields let the frontend cache what the AI actually used for each call.
 """
 
 ENDPOINT_PROMPTS = {
+    # ── Core ──────────────────────────────────────────────────────────────────
     "context": {
-        "instructions": """Summarize the user's current emotional + situational context in one short internal snapshot.
-This is used by other endpoints, not shown directly to the user, so it can be slightly more descriptive (still max 80 words).""",
+        "instructions": (
+            "Summarise the user's current emotional + situational context in one short internal snapshot. "
+            "This powers other endpoints, so be accurate rather than motivational here (still max 80 words)."
+        ),
         "schema": """{
   "mood": string,
   "energy": "low" | "medium" | "high",
   "summary": string,
-  "suggested_focus_area": string
+  "suggested_focus_area": string,
+  "detected_mood": string,
+  "detected_personality": string
 }""",
     },
+
     "coach": {
-        "instructions": """Generate ONE coach card responding to the user's current mood/energy and goals.
-Follow the emotional arc rule exactly: acknowledge -> tiny action -> why -> reward.""",
+        "instructions": (
+            "Generate ONE coach card responding to the user's current mood, energy, and goals. "
+            "Follow the emotional arc exactly: acknowledge → tiny action → why → reward. "
+            "actions: 1–3 micro-tasks, each under 15 words. points: 10–100 based on effort."
+        ),
         "schema": """{
   "message": string,
   "actions": [string],
   "points": number,
-  "emotion": string
+  "emotion": string,
+  "detected_mood": string,
+  "detected_personality": string
 }""",
     },
+
+    # ── Planning ───────────────────────────────────────────────────────────────
     "focus": {
-        "instructions": """Generate today's focus: 1-3 small tasks that fit the user's available free_minutes and energy level.
-Tasks must be realistically completable in the given time window.""",
+        "instructions": (
+            "Generate 1–3 small focus tasks that fit within the user's available free_minutes and energy level. "
+            "Every task must be realistically completable in the given time window. "
+            "points per task: 10–50, higher for harder tasks."
+        ),
         "schema": """{
   "focus_title": string,
   "focus_message": string,
   "tasks": [
     { "title": string, "points": number }
-  ]
+  ],
+  "detected_personality": string
 }""",
     },
+
     "plan": {
-        "instructions": """Create a short personalized plan/schedule suggestion based on goals, calendar gaps, energy, and mood.
-Do not overload the day — 2-4 items max. This is a suggestion, not a rigid schedule.""",
+        "instructions": (
+            "Create a short personalised day plan based on goals, calendar gaps, energy, and mood. "
+            "2–4 items max — suggest don't overload. time_suggestion is a human label like '9am' or 'after lunch'. "
+            "points per item: 10–75."
+        ),
         "schema": """{
   "plan_title": string,
   "plan_message": string,
   "items": [
     { "title": string, "time_suggestion": string, "points": number }
-  ]
+  ],
+  "detected_mood": string,
+  "detected_personality": string
 }""",
     },
+
+    # ── Wellbeing ──────────────────────────────────────────────────────────────
     "intervention": {
-        "instructions": """The user is doom-scrolling, binge-watching, or wasting time. Interrupt playfully and kindly — never judgmental.
-Offer ONE fun, tiny alternative action. Keep it light and funny if personality allows.""",
+        "instructions": (
+            "The user is doom-scrolling, binge-watching, or wasting time. Interrupt playfully and kindly — "
+            "never judgmental. Offer ONE fun, tiny alternative action. Light humour where personality allows. "
+            "cta: short button label like 'Do it' or 'Let's go'."
+        ),
         "schema": """{
   "title": string,
   "message": string,
   "points": number,
-  "cta": string
+  "cta": string,
+  "detected_personality": string
 }""",
     },
+
     "future-me": {
-        "instructions": """Project a warm, realistic, emotionally compelling vision of the user's future if they stay consistent
-with the given goal at the given consistency %. Be specific but not absurd (no overpromising).""",
+        "instructions": (
+            "Project a warm, realistic, emotionally compelling vision of the user's future if they stay "
+            "consistent with their goal at the given consistency %. Be specific but never overpromise."
+        ),
         "schema": """{
   "title": string,
-  "message": string
+  "message": string,
+  "detected_personality": string
 }""",
     },
+
     "recap": {
-        "instructions": """Summarize the user's day based on completed actions into a warm evening recap.
-Make them feel proud. End with a small forward-looking note (not a new task, just warmth).""",
+        "instructions": (
+            "Summarise the user's day from their completed actions into a warm evening recap. "
+            "Make them feel proud. End with a brief forward-looking note (warmth, not a new task). "
+            "completed: echo back the completed_actions list as-is."
+        ),
         "schema": """{
   "title": string,
   "message": string,
   "completed": [string],
-  "total_points": number
+  "total_points": number,
+  "detected_personality": string
 }""",
     },
+
+    # ── Engagement ────────────────────────────────────────────────────────────
     "music": {
-        "instructions": """Suggest a music mood/playlist type based on the user's current goal, mood, and activity.
-Do not invent real song titles or artists — describe playlist vibe/genre instead.""",
+        "instructions": (
+            "Suggest a music mood/playlist vibe based on the user's activity, mood, and energy. "
+            "Do NOT invent real artist names or song titles — describe genre and vibe only. "
+            "genre_tags: 2–5 short tags like ['lo-fi', 'chill', 'instrumental']."
+        ),
         "schema": """{
   "playlist_mood": string,
   "message": string,
-  "genre_tags": [string]
+  "genre_tags": [string],
+  "detected_mood": string,
+  "detected_personality": string
 }""",
     },
+
     "reward": {
-        "instructions": """Give the user an encouraging update on their progress toward their self-chosen reward.
-Use their current points and the reward's point cost to motivate, never guilt.""",
+        "instructions": (
+            "Give the user an encouraging progress update toward their self-chosen reward. "
+            "points_remaining = reward_cost - current_points (never negative). "
+            "Motivate without guilt — celebrate how far they've come."
+        ),
         "schema": """{
   "reward": string,
   "points_remaining": number,
-  "message": string
+  "message": string,
+  "detected_personality": string
 }""",
     },
-    "memory/extract": {
-        "instructions": """Extract durable, useful personalization facts from the raw user input (chat message, voice transcript, or journal entry).
-Only extract facts likely to remain true for weeks/months (preferences, patterns, routines, emotional tendencies).
-Do NOT extract one-off statements ("I'm tired today") as permanent memories.""",
-        "schema": """{
-  "memories": [string],
-  "confidence": "low" | "medium" | "high"
-}""",
-    },
+
     "goals/progress": {
-        "instructions": """Given a goal and current progress, generate an encouraging progress update with a realistic projection.
-Projection must be a reasonable extrapolation from the given pace, not a wild guess.""",
+        "instructions": (
+            "Given a goal and current progress %, generate an encouraging update with a realistic projection. "
+            "prediction must extrapolate from current pace — don't guess wildly. "
+            "Example: 'At this pace you'll hit 100% in ~3 weeks.'"
+        ),
         "schema": """{
   "goal": string,
   "progress": number,
   "message": string,
-  "prediction": string
+  "prediction": string,
+  "detected_personality": string
+}""",
+    },
+
+    # ── Memory ────────────────────────────────────────────────────────────────
+    "memory/extract": {
+        "instructions": (
+            "Extract durable personalisation facts from the user's raw input. "
+            "Only extract facts likely to stay true for weeks/months (preferences, patterns, routines, tendencies). "
+            "Do NOT extract one-off states ('I'm tired today'). "
+            "confidence: how certain you are these are genuine durable facts."
+        ),
+        "schema": """{
+  "memories": [string],
+  "confidence": "low" | "medium" | "high"
 }""",
     },
 }
