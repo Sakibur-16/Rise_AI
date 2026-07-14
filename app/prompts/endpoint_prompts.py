@@ -163,6 +163,68 @@ ENDPOINT_PROMPTS = {
 }""",
     },
 
+    # ── Master chat ───────────────────────────────────────────────────────────
+    "chat": {
+        "instructions": (
+            "You are orchestrating a unified Rise AI response from a single user request.\n"
+            "The user prompt ends with a line: 'CARDS TO GENERATE: coach, focus, ...'.\n"
+            "Fill ONLY the listed cards. Set every other card field to null.\n\n"
+            "Card rules:\n"
+            "  coach        — always filled. ONE card, emotional arc: acknowledge → action → why → reward.\n"
+            "  focus        — 1–3 micro-tasks fitting free_minutes and energy. points 10–50 each.\n"
+            "  plan         — 2–4 items using calendar_gaps. time_suggestion = human label ('9am', 'after lunch').\n"
+            "  intervention — playful, kind. ONE tiny alternative action. cta = short button label.\n"
+            "  music        — genre + vibe only. NO real artist names. genre_tags: 2–5 short tags.\n"
+            "  reward       — points_remaining = reward_cost - current_points (never negative).\n"
+            "  recap        — warm evening summary. echo completed list back. end with brief forward note.\n\n"
+            "intent: one sentence describing what the user needs right now (e.g. 'User is tired — gentle focus + music to ease in')."
+        ),
+        "schema": """{
+  "intent": string,
+  "detected_mood": string,
+  "detected_energy": "low" | "medium" | "high",
+  "detected_personality": "sweet" | "strict" | "sarcastic" | "ceo" | "therapeutic",
+  "coach": {
+    "message": string,
+    "actions": [string],
+    "points": number,
+    "emotion": string
+  },
+  "focus": {
+    "focus_title": string,
+    "focus_message": string,
+    "tasks": [{ "title": string, "points": number }]
+  } | null,
+  "plan": {
+    "plan_title": string,
+    "plan_message": string,
+    "items": [{ "title": string, "time_suggestion": string, "points": number }]
+  } | null,
+  "intervention": {
+    "title": string,
+    "message": string,
+    "points": number,
+    "cta": string
+  } | null,
+  "music": {
+    "playlist_mood": string,
+    "message": string,
+    "genre_tags": [string]
+  } | null,
+  "reward": {
+    "reward": string,
+    "points_remaining": number,
+    "message": string
+  } | null,
+  "recap": {
+    "title": string,
+    "message": string,
+    "completed": [string],
+    "total_points": number
+  } | null
+}""",
+    },
+
     # ── Memory ────────────────────────────────────────────────────────────────
     "memory/extract": {
         "instructions": (

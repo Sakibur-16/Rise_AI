@@ -29,11 +29,13 @@ from app.models import (
     ContextRequest, CoachRequest, FocusRequest, PlanRequest,
     InterventionRequest, FutureMeRequest, RecapRequest,
     MusicRequest, RewardRequest, GoalsProgressRequest, MemoryExtractRequest,
+    ChatRequest,
     # responses
     ContextResponse, CoachResponse, FocusResponse, PlanResponse,
     InterventionResponse, FutureMeResponse, RecapResponse,
     MusicResponse, RewardResponse, GoalsProgressResponse, MemoryExtractResponse,
     HealthResponse, CostResponse, MemoryReadResponse,
+    ChatResponse,
 )
 from app.prompts.base_prompt import build_system_prompt
 from app.prompts.endpoint_prompts import ENDPOINT_PROMPTS
@@ -423,6 +425,103 @@ async def ai_goals_progress(req: GoalsProgressRequest):
         "Generate a progress update with a realistic prediction.",
     ])
     return await _run_endpoint("goals/progress", req, user_prompt)
+
+
+# ── Master chat ───────────────────────────────────────────────────────────────
+
+@app.post(
+    "/ai/chat",
+    tags=["Core"],
+    summary="Master unified endpoint",
+    description=(
+        "Single entry point that replaces calling multiple endpoints separately. "
+        "Pass everything you know about the user — the AI decides which cards to generate "
+        "and returns them all in one response.\n\n"
+        "**Cards returned based on what you provide:**\n"
+        "- `coach` — always returned\n"
+        "- `focus` — when `free_minutes` is set\n"
+        "- `plan` — when `calendar_gaps` is set\n"
+        "- `intervention` — when `current_activity` + `minutes_on_activity` are set\n"
+        "- `recap` — when `completed_today` has items\n"
+        "- `reward` — when `active_reward` is set\n"
+        "- `music` — always returned (mood/energy aware)\n\n"
+        "All detection (`mood`, `energy`, `coach_personality`) is auto-inferred from `message` when not explicitly set."
+    ),
+    response_model=ChatResponse,
+)
+async def ai_chat(req: ChatRequest):
+    config = ENDPOINT_PROMPTS["chat"]
+
+    memories = req.memories if req.memories is not None else get_memories(req.user_id)
+
+    # Determine which cards to generate based on provided context
+    cards = ["coach", "music"]
+    if req.free_minutes:
+        cards.append("focus")
+    if req.calendar_gaps:
+        cards.append("plan")
+    if req.current_activity and req.minutes_on_activity:
+        cards.append("intervention")
+    if req.completed_today:
+        cards.append("recap")
+    if req.active_reward:
+        cards.append("reward")
+
+    # Build user prompt
+    lines = [f'User message: "{req.message}"', ""]
+
+    if req.goals:
+        lines.append(f"Goals: {', '.join(req.goals)}")
+    if req.mood:
+        lines.append(f"Mood (explicit): {req.mood}")
+    if req.energy:
+        lines.append(f"Energy (explicit): {req.energy}")
+    if req.free_minutes:
+        lines.append(f"Free time available: {req.free_minutes} minutes")
+    if req.calendar_gaps:
+        lines.append(f"Calendar gaps: {', '.join(req.calendar_gaps)}")
+    if req.completed_today:
+        lines.append(f"Completed today: {', '.join(req.completed_today)}")
+        lines.append(f"Points earned today: {req.total_points_today}")
+    if req.active_reward:
+        r = req.active_reward
+        lines.append(
+            f"Working toward reward: '{r.reward}' "
+            f"({r.current_points}/{r.reward_cost} points)"
+        )
+    if req.current_activity and req.minutes_on_activity:
+        lines.append(
+            f"Currently doing: '{req.current_activity}' "
+            f"for {req.minutes_on_activity} minutes"
+        )
+
+    lines += ["", f"CARDS TO GENERATE: {', '.join(cards)}", "Set all other cards to null."]
+    user_prompt = "\n".join(lines)
+
+    system_prompt = build_system_prompt(
+        personality=req.coach_personality,
+        memories=memories,
+        extra_instructions=(
+            f"{config['instructions']}\n\n"
+            f"Return JSON matching EXACTLY this schema:\n{config['schema']}"
+        ),
+        needs_mood_detection=req.mood is None,
+        needs_energy_detection=req.energy is None,
+    )
+
+    try:
+        result = await call_claude_json(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            max_tokens=1500,
+        )
+    except AIServiceError as err:
+        raise HTTPException(
+            status_code=err.status_code,
+            detail={"error": err.code, "message": err.message},
+        )
+
+    return {**result["data"], "meta": result["usage"]}
 
 
 # ── Streaming (SSE) ───────────────────────────────────────────────────────────

@@ -333,6 +333,54 @@ class GoalsProgressRequest(BaseAIRequest):
     )
 
 
+class ActiveReward(BaseModel):
+    reward:         str
+    current_points: int = Field(..., ge=0)
+    reward_cost:    int = Field(..., ge=1)
+
+
+class ChatRequest(BaseModel):
+    model_config = ConfigDict(json_schema_extra={"example": {
+        "user_id": "user_001",
+        "message": "I'm exhausted but I have some free time this afternoon",
+        "coach_personality": "auto",
+        "goals": ["Exercise 3x this week", "Read 24 books this year"],
+        "mood": None,
+        "energy": None,
+        "free_minutes": 45,
+        "calendar_gaps": ["3pm-5pm"],
+        "completed_today": ["Morning walk 20 min", "Read 15 pages"],
+        "total_points_today": 120,
+        "active_reward": {
+            "reward": "New running shoes",
+            "current_points": 340,
+            "reward_cost": 500,
+        },
+        "current_activity": "doom-scrolling Instagram",
+        "minutes_on_activity": 35,
+    }})
+
+    user_id:              str = Field(..., description="User ID. Stored memories are auto-loaded.", examples=["user_001"])
+    message:              str = Field(..., description=_MESSAGE_DESC, examples=["I'm exhausted but have some free time"])
+    coach_personality:    CoachPersonality = Field("auto", description=_PERSONALITY_DESC)
+    memories:             Optional[list[str]] = Field(None, description="Inline memories. Overrides stored memories when provided.")
+
+    goals:                list[str] = Field([], description="Active goals.", examples=[["Exercise 3x this week"]])
+    mood:                 Optional[str] = Field(None, description="Current mood. Auto-detected from `message` if null.")
+    energy:               Optional[EnergyLevel] = Field(None, description="Current energy. Auto-detected from `message` if null.")
+
+    free_minutes:         Optional[int] = Field(None, ge=5, le=480, description="Free time available (minutes). Triggers a **focus** card.")
+    calendar_gaps:        list[str] = Field([], description="Free time blocks e.g. '9am–11am'. Triggers a **plan** card.", examples=[["3pm-5pm"]])
+
+    completed_today:      list[str] = Field([], description="Actions completed today. Triggers a **recap** card.", examples=[["Morning walk", "Read 15 pages"]])
+    total_points_today:   int = Field(0, ge=0, description="Points earned today. Used in recap.")
+
+    active_reward:        Optional[ActiveReward] = Field(None, description="Reward the user is working toward. Triggers a **reward** card.")
+
+    current_activity:     Optional[str] = Field(None, description="Distraction activity in progress. Triggers an **intervention** card.", examples=["doom-scrolling Instagram"])
+    minutes_on_activity:  Optional[int] = Field(None, ge=1, description="Minutes spent on the distraction.", examples=[35])
+
+
 class MemoryExtractRequest(BaseModel):
     model_config = ConfigDict(json_schema_extra={"example": {
         "user_id": "user_001",
@@ -480,3 +528,67 @@ class CostResponse(BaseModel):
 class MemoryReadResponse(BaseModel):
     user_id:  str
     memories: list[str]
+
+
+# ── Chat (master) card types ──────────────────────────────────────────────────
+
+class CoachCard(BaseModel):
+    message: str
+    actions: list[str]
+    points:  int
+    emotion: str
+
+
+class FocusCard(BaseModel):
+    focus_title:   str
+    focus_message: str
+    tasks:         list[FocusTask]
+
+
+class PlanCard(BaseModel):
+    plan_title:   str
+    plan_message: str
+    items:        list[PlanItem]
+
+
+class InterventionCard(BaseModel):
+    title:   str
+    message: str
+    points:  int
+    cta:     str
+
+
+class MusicCard(BaseModel):
+    playlist_mood: str
+    message:       str
+    genre_tags:    list[str]
+
+
+class RewardCard(BaseModel):
+    reward:           str
+    points_remaining: int
+    message:          str
+
+
+class RecapCard(BaseModel):
+    title:        str
+    message:      str
+    completed:    list[str]
+    total_points: int
+
+
+class ChatResponse(BaseModel):
+    intent:               str
+    detected_mood:        str
+    detected_energy:      EnergyLevel
+    detected_personality: str
+
+    coach:        CoachCard
+    focus:        Optional[FocusCard]        = None
+    plan:         Optional[PlanCard]         = None
+    intervention: Optional[InterventionCard] = None
+    music:        Optional[MusicCard]        = None
+    reward:       Optional[RewardCard]       = None
+    recap:        Optional[RecapCard]        = None
+
+    meta: UsageMeta
